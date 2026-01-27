@@ -675,7 +675,7 @@ class BigQueryCachingExecutor(executor.Executor):
             result_bf_schema = _result_schema(og_schema, list(compiled.sql_schema))
             dst = query_job.destination
             result_bq_data = bq_data.BigqueryDataSource(
-                table=bq_data.GbqTable(
+                table=bq_data.GbqNativeTable(
                     dst.project,
                     dst.dataset_id,
                     dst.table_id,

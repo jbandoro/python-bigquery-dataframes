@@ -22,7 +22,7 @@ import os
 import queue
 import threading
 import typing
-from typing import Any, Iterator, Optional, Sequence, Tuple
+from typing import Any, Iterator, List, Optional, Sequence, Tuple, Union
 
 from google.cloud import bigquery_storage_v1
 import google.cloud.bigquery as bq
@@ -37,23 +37,48 @@ if typing.TYPE_CHECKING:
     import bigframes.core.ordering as orderings
 
 
+# what is the line between metadata and core fields? Mostly metadata fields are optional or unreliable, but its fuzzy
 @dataclasses.dataclass(frozen=True)
-class GbqTable:
+class TableMetadata:
+    # this size metadata might be stale, don't use where strict correctness is needed
+    numBytes: Optional[int] = None
+    numRows: Optional[int] = None
+    location: Optional[str] = None
+    type: Optional[str] = None
+    created_time: Optional[datetime.datetime] = None
+    modified_time: Optional[datetime.datetime] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class GbqNativeTable:
     project_id: str = dataclasses.field()
     dataset_id: str = dataclasses.field()
     table_id: str = dataclasses.field()
     physical_schema: Tuple[bq.SchemaField, ...] = dataclasses.field()
     is_physically_stored: bool = dataclasses.field()
-    cluster_cols: typing.Optional[Tuple[str, ...]]
+    partition_col: Optional[str] = None
+    cluster_cols: typing.Optional[Tuple[str, ...]] = None
+    primary_key: Optional[Tuple[str, ...]] = None
+    metadata: TableMetadata = TableMetadata()
 
     @staticmethod
-    def from_table(table: bq.Table, columns: Sequence[str] = ()) -> GbqTable:
+    def from_table(table: bq.Table, columns: Sequence[str] = ()) -> GbqNativeTable:
         # Subsetting fields with columns can reduce cost of row-hash default ordering
         if columns:
             schema = tuple(item for item in table.schema if item.name in columns)
         else:
             schema = tuple(table.schema)
-        return GbqTable(
+
+        metadata = TableMetadata(
+            numBytes=table.num_bytes,
+            numRows=table.num_rows,
+            location=table.location,  # type: ignore
+            type=table.table_type,  # type: ignore
+            created_time=table.created,
+            modified_time=table.modified,
+        )
+
+        return GbqNativeTable(
             project_id=table.project,
             dataset_id=table.dataset_id,
             table_id=table.table_id,
@@ -62,6 +87,8 @@ class GbqTable:
             cluster_cols=None
             if table.clustering_fields is None
             else tuple(table.clustering_fields),
+            primary_key=tuple(_get_primary_keys(table)),
+            metadata=metadata,
         )
 
     @staticmethod
@@ -69,8 +96,8 @@ class GbqTable:
         table_ref: bq.TableReference,
         schema: Sequence[bq.SchemaField],
         cluster_cols: Optional[Sequence[str]] = None,
-    ) -> GbqTable:
-        return GbqTable(
+    ) -> GbqNativeTable:
+        return GbqNativeTable(
             project_id=table_ref.project,
             dataset_id=table_ref.dataset_id,
             table_id=table_ref.table_id,
@@ -84,10 +111,46 @@ class GbqTable:
             bq.DatasetReference(self.project_id, self.dataset_id), self.table_id
         )
 
+    def get_full_id(self, quoted: bool = False) -> str:
+        if quoted:
+            return f"`{self.project_id}`.`{self.dataset_id}`.`{self.table_id}`"
+        return f"{self.project_id}.{self.dataset_id}.{self.table_id}"
+
     @property
     @functools.cache
     def schema_by_id(self):
         return {col.name: col for col in self.physical_schema}
+
+
+@dataclasses.dataclass(frozen=True)
+class BiglakeIcebergTable:
+    project_id: str = dataclasses.field()
+    catalog_id: str = dataclasses.field()
+    namespace_id: str = dataclasses.field()
+    table_id: str = dataclasses.field()
+    physical_schema: Tuple[bq.SchemaField, ...] = dataclasses.field()
+    cluster_cols: typing.Optional[Tuple[str, ...]]
+    metadata: TableMetadata
+
+    def get_full_id(self, quoted: bool = False) -> str:
+        if quoted:
+            return f"`{self.project_id}`.`{self.catalog_id}`.`{self.namespace_id}`.`{self.table_id}`"
+        return (
+            f"{self.project_id}.{self.catalog_id}.{self.namespace_id}.{self.table_id}"
+        )
+
+    @property
+    @functools.cache
+    def schema_by_id(self):
+        return {col.name: col for col in self.physical_schema}
+
+    @property
+    def partition_col(self) -> Optional[str]:
+        return None
+
+    @property
+    def primary_key(self) -> Optional[Tuple[str, ...]]:
+        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,7 +167,7 @@ class BigqueryDataSource:
             self.schema.names
         )
 
-    table: GbqTable
+    table: Union[GbqNativeTable, BiglakeIcebergTable]
     schema: bigframes.core.schema.ArraySchema
     at_time: typing.Optional[datetime.datetime] = None
     # Added for backwards compatibility, not validated
@@ -188,6 +251,8 @@ def get_arrow_batches(
     project_id: str,
     sample_rate: Optional[float] = None,
 ) -> ReadResult:
+    assert isinstance(data.table, GbqNativeTable)
+
     table_mod_options = {}
     read_options_dict: dict[str, Any] = {"selected_fields": list(columns)}
 
@@ -245,3 +310,21 @@ def get_arrow_batches(
     return ReadResult(
         batches, session.estimated_row_count, session.estimated_total_bytes_scanned
     )
+
+
+def _get_primary_keys(
+    table: bq.Table,
+) -> List[str]:
+    """Get primary keys from table if they are set."""
+
+    primary_keys: List[str] = []
+    if (
+        (table_constraints := getattr(table, "table_constraints", None)) is not None
+        and (primary_key := table_constraints.primary_key) is not None
+        # This will be False for either None or empty list.
+        # We want primary_keys = None if no primary keys are set.
+        and (columns := primary_key.columns)
+    ):
+        primary_keys = columns if columns is not None else []
+
+    return primary_keys
